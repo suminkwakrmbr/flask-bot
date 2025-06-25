@@ -7,8 +7,46 @@ app = Flask(__name__)
 SLACK_TOKEN = os.environ.get('SLACK_TOKEN')
 SLACK_API_URL = 'https://slack.com/api/chat.postMessage'
 
-def get_summary_from_gptonline(text):
-    return f"📝 요약 결과: '{text}' 에 대한 핵심 내용 정리 완료!"
+def get_gemini_summary(text):
+    try:
+        # 여기서 import (런타임에 확인)
+        import google.generativeai as genai
+        
+        # API 키 설정
+        genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
+        
+        # 모델 선택
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # 텍스트 정리
+        clean_text = text.replace('<@U092S5G2P7V>', '').replace('요약해줘', '').strip()
+        
+        if len(clean_text) < 10:
+            return "📝 요약할 내용을 함께 알려주세요!"
+        
+        # 프롬프트
+        prompt = f"""다음 내용을 한국어로 간단히 요약해주세요:
+
+{clean_text}
+
+요약 형식:
+- 3-5줄로 핵심 내용 정리
+- 주요 키워드 포함
+- 이해하기 쉽게 작성"""
+        
+        # API 요청
+        response = model.generate_content(prompt)
+        
+        if response.text:
+            return f"📝 **AI 요약 결과**\n\n{response.text}"
+        else:
+            return "📝 요약 생성에 실패했습니다."
+            
+    except ImportError:
+        return "📝 Gemini 패키지가 설치되지 않았습니다."
+    except Exception as e:
+        print(f"Gemini API 오류: {e}")
+        return f"📝 요약 중 오류가 발생했습니다: {str(e)}"
 
 @app.route('/')
 def home():
@@ -21,7 +59,6 @@ def slack_events():
     
     try:
         data = request.get_json(force=True)
-        print(f"데이터: {data}")
         
         # Challenge 처리
         if data and 'challenge' in data:
@@ -31,34 +68,22 @@ def slack_events():
         if data and 'event' in data:
             event = data['event']
             event_type = event.get('type')
-            print(f"이벤트 타입: {event_type}")
             
-            # message 타입과 app_mention 타입 모두 처리
             if event_type in ['message', 'app_mention']:
                 user_message = event.get('text', '')
                 channel_id = event.get('channel')
-                user_id = event.get('user')
                 
-                print(f"메시지: {user_message}")
-                print(f"채널: {channel_id}")
-                print(f"사용자: {user_id}")
-                
-                # 봇 자신의 메시지는 무시 (무한 루프 방지)
+                # 봇 자신의 메시지 무시
                 if event.get('bot_id'):
-                    print("봇 메시지 무시")
                     return 'ok'
                 
-                # 봇이 멘션된 경우만 처리
-                if '<@U092S5G2P7V>' in user_message:  # 실제 봇 ID
-                    print("봇 멘션 감지!")
-                    
+                # 봇 멘션 확인
+                if '<@U092S5G2P7V>' in user_message:
                     if '요약해줘' in user_message:
-                        print("요약 요청 처리 중...")
-                        summary = get_summary_from_gptonline(user_message)
-                        result = send_message_to_slack(channel_id, summary)
-                        print(f"메시지 전송 결과: {result}")
+                        summary = get_gemini_summary(user_message)
+                        send_message_to_slack(channel_id, summary)
                     else:
-                        send_message_to_slack(channel_id, "안녕하세요! '요약해줘'라고 말씀해주세요 😊")
+                        send_message_to_slack(channel_id, "안녕하세요! '요약해줘 [내용]'이라고 말씀해주세요 😊")
         
         return 'ok'
         
@@ -71,8 +96,6 @@ def send_message_to_slack(channel, text):
         print("❌ SLACK_TOKEN이 설정되지 않았습니다!")
         return False
         
-    print(f"메시지 전송 시도: 채널={channel}, 텍스트={text}")
-    
     headers = {
         'Authorization': f'Bearer {SLACK_TOKEN}',
         'Content-Type': 'application/json'
@@ -84,21 +107,11 @@ def send_message_to_slack(channel, text):
     
     try:
         response = requests.post(SLACK_API_URL, headers=headers, json=payload)
-        print(f"API 응답 상태: {response.status_code}")
-        print(f"API 응답 내용: {response.text}")
-        
         if response.status_code == 200:
             result = response.json()
-            if result.get('ok'):
-                print("✅ 메시지 전송 성공!")
-                return True
-            else:
-                print(f"❌ 메시지 전송 실패: {result.get('error')}")
-        else:
-            print(f"❌ HTTP 에러: {response.status_code}")
-            
+            return result.get('ok', False)
     except Exception as e:
-        print(f"❌ 요청 에러: {e}")
+        print(f"❌ 메시지 전송 에러: {e}")
     
     return False
 
