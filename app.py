@@ -18,26 +18,45 @@ def home():
 def health():
     return {"status": "healthy", "message": "Server is running"}
 
-@app.route('/slack/events', methods=['POST'])
+@app.route('/slack/events', methods=['POST', 'GET'])
 def slack_events():
-    data = request.json
+    print("=== Slack Events 요청 받음 ===")
     
-    if 'challenge' in data:
-        return jsonify({'challenge': data['challenge']})
+    # GET 요청 처리 (테스트용)
+    if request.method == 'GET':
+        return "Slack Events endpoint is working!"
     
-    if 'event' in data:
-        event = data['event']
-        event_type = event.get('type')
+    # POST 요청 처리
+    try:
+        data = request.get_json()
+        print(f"받은 데이터: {data}")
         
-        if event_type == 'app_mention':
-            user_message = event.get('text', '')
-            channel_id = event.get('channel')
+        # Challenge 검증 (Slack URL 인증)
+        if data and 'challenge' in data:
+            challenge = data['challenge']
+            print(f"Challenge 요청: {challenge}")
+            return jsonify({'challenge': challenge})
+        
+        # 실제 이벤트 처리
+        if data and 'event' in data:
+            event = data['event']
+            event_type = event.get('type')
+            print(f"이벤트 타입: {event_type}")
             
-            if '요약해줘' in user_message:
-                summary = get_summary_from_gptonline(user_message)
-                send_message_to_slack(channel_id, summary)
-    
-    return '', 200
+            if event_type == 'app_mention':
+                user_message = event.get('text', '')
+                channel_id = event.get('channel')
+                print(f"멘션 메시지: {user_message}")
+                
+                if '요약해줘' in user_message:
+                    summary = get_summary_from_gptonline(user_message)
+                    send_message_to_slack(channel_id, summary)
+        
+        return '', 200
+        
+    except Exception as e:
+        print(f"에러 발생: {e}")
+        return f"Error: {str(e)}", 400
 
 def send_message_to_slack(channel, text):
     if not SLACK_TOKEN:
@@ -58,5 +77,5 @@ def send_message_to_slack(channel, text):
         print(f"❌ 슬랙 전송 실패: {response.text}")
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))  # ✅ Render PORT 사용
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
