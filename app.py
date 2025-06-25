@@ -16,6 +16,7 @@ SLACK_USERS_INFO_URL = 'https://slack.com/api/users.info'
 # 중복 요청 방지 캐시
 processed_messages = {}
 user_cache = {}  # 사용자 정보 캐시
+    
 
 def is_duplicate_message(user_id, channel_id, message_text, timestamp):
     """중복 메시지 확인"""
@@ -65,8 +66,70 @@ def get_user_name(user_id):
         user_cache[user_id] = 'Unknown'
         return 'Unknown'
 
+def get_channel_messages_with_pagination(channel_id, days_back=30):
+    """페이지네이션을 사용해서 더 많은 메시지 가져오기"""
+    try:
+        since_time = datetime.now() - timedelta(days=days_back)
+        oldest_timestamp = since_time.timestamp()
+        
+        headers = {
+            'Authorization': f'Bearer {SLACK_TOKEN}',
+            'Content-Type': 'application/json'
+        }
+        
+        all_messages = []
+        cursor = None
+        page_count = 0
+        max_pages = 50  # 최대 50페이지 (약 10,000개 메시지)
+        
+        print(f"📊 {days_back}일간 메시지 수집 시작...")
+        
+        while page_count < max_pages:
+            params = {
+                'channel': channel_id,
+                'oldest': oldest_timestamp,
+                'limit': 200  # 페이지당 200개
+            }
+            
+            if cursor:
+                params['cursor'] = cursor
+            
+            response = requests.get(SLACK_CONVERSATIONS_HISTORY_URL, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('ok'):
+                    messages = data.get('messages', [])
+                    if not messages:
+                        break
+                    
+                    all_messages.extend(messages)
+                    page_count += 1
+                    
+                    print(f"📄 페이지 {page_count}: {len(messages)}개 메시지 수집 (총 {len(all_messages)}개)")
+                    
+                    # 다음 페이지 확인
+                    if data.get('has_more') and data.get('response_metadata', {}).get('next_cursor'):
+                        cursor = data['response_metadata']['next_cursor']
+                        time.sleep(0.5)  # API 호출 간격 조절
+                    else:
+                        break
+                else:
+                    print(f"API 오류: {data.get('error')}")
+                    break
+            else:
+                print(f"HTTP 오류: {response.status_code}")
+                break
+        
+        print(f"✅ 총 {len(all_messages)}개 메시지 수집 완료")
+        return all_messages
+        
+    except Exception as e:
+        print(f"메시지 수집 오류: {e}")
+        return []
+
 def get_channel_messages(channel_id, hours_back=24):
-    """채널의 최근 메시지들을 가져오기"""
+    """단기간 메시지 가져오기 (기존 함수)"""
     try:
         since_time = datetime.now() - timedelta(hours=hours_back)
         oldest_timestamp = since_time.timestamp()
@@ -79,7 +142,7 @@ def get_channel_messages(channel_id, hours_back=24):
         params = {
             'channel': channel_id,
             'oldest': oldest_timestamp,
-            'limit': 200  # 더 많은 메시지 가져오기
+            'limit': 200
         }
         
         response = requests.get(SLACK_CONVERSATIONS_HISTORY_URL, headers=headers, params=params)
@@ -130,6 +193,55 @@ def get_thread_messages(channel_id, thread_ts):
         print(f"스레드 메시지 가져오기 오류: {e}")
         return []
 
+def analyze_messages_by_period(messages, days_back):
+    """메시지를 기간별로 분석"""
+    now = datetime.now()
+    
+    # 시간대별 분류
+    periods = {
+        'recent': [],    # 최근 7일
+        'weekly': [],    # 1주-2주 전
+        'monthly': []    # 2주-30일 전
+    }
+    
+    user_activity = {}
+    daily_counts = {}
+    
+    for message in messages:
+        if message.get('bot_id') or message.get('subtype') in ['channel_join', 'channel_leave']:
+            continue
+            
+        try:
+            msg_time = datetime.fromtimestamp(float(message.get('ts', 0)))
+            days_ago = (now - msg_time).days
+            user_id = message.get('user')
+            
+            # 기간별 분류
+            if days_ago <= 7:
+                periods['recent'].append(message)
+            elif days_ago <= 14:
+                periods['weekly'].append(message)
+            else:
+                periods['monthly'].append(message)
+            
+            # 사용자 활동 추적
+            if user_id:
+                user_name = get_user_name(user_id)
+                if user_name not in user_activity:
+                    user_activity[user_name] = 0
+                user_activity[user_name] += 1
+            
+            # 일별 카운트
+            date_key = msg_time.strftime('%Y-%m-%d')
+            if date_key not in daily_counts:
+                daily_counts[date_key] = 0
+            daily_counts[date_key] += 1
+            
+        except:
+            continue
+    
+    return periods, user_activity, daily_counts
+
 def format_messages_for_summary(messages, include_time=True):
     """메시지들을 요약하기 좋은 형태로 포맷팅"""
     formatted_messages = []
@@ -151,19 +263,101 @@ def format_messages_for_summary(messages, include_time=True):
             if include_time and timestamp:
                 try:
                     msg_time = datetime.fromtimestamp(float(timestamp))
-                    time_str = f"[{msg_time.strftime('%H:%M')}] "
+                    time_str = f"[{msg_time.strftime('%m/%d %H:%M')}] "
                 except:
                     time_str = ''
             
-            # 멘션 정리
+            # 멘션 정리 및 텍스트 길이 제한
             clean_text = re.sub(r'<@[A-Z0-9]+>', '@사용자', text)
+            if len(clean_text) > 100:
+                clean_text = clean_text[:100] + "..."
+            
             formatted_msg = f"{time_str}{user_name}: {clean_text}"
             formatted_messages.append(formatted_msg)
     
     return '\n'.join(formatted_messages)
 
+def get_long_term_channel_summary(channel_id, days_back=30):
+    """장기간 채널 대화를 요약 (30일 등)"""
+    try:
+        print(f"🔍 {days_back}일간 채널 분석 시작...")
+        
+        # 메시지 수집 (페이지네이션 사용)
+        all_messages = get_channel_messages_with_pagination(channel_id, days_back)
+        
+        if not all_messages:
+            return f"📊 **{days_back}일간 채널 분석**\n\n해당 기간 동안 메시지가 없습니다."
+        
+        # 실제 대화 메시지만 필터링
+        real_messages = [msg for msg in all_messages if not msg.get('bot_id') and not msg.get('subtype')]
+        
+        if len(real_messages) < 5:
+            return f"📊 **{days_back}일간 채널 분석**\n\n해당 기간의 대화가 너무 적어서 분석하기 어렵습니다."
+        
+        # 메시지 분석
+        periods, user_activity, daily_counts = analyze_messages_by_period(real_messages, days_back)
+        
+        # 상위 활성 사용자
+        top_users = sorted(user_activity.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        # 최근 중요 메시지들만 샘플링 (너무 길면 API 한계)
+        sample_messages = real_messages[:50] + real_messages[-50:] if len(real_messages) > 100 else real_messages
+        formatted_text = format_messages_for_summary(sample_messages[:100])  # 최대 100개만
+        
+        # Gemini로 요약
+        import google.generativeai as genai
+        
+        genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = f"""다음은 Slack 채널에서 최근 {days_back}일 동안의 대화 샘플입니다. 장기적 관점에서 주요 내용을 한국어로 요약해주세요:
+
+{formatted_text}
+
+분석 정보:
+- 총 메시지 수: {len(real_messages)}개
+- 활성 사용자: {len(user_activity)}명
+- 분석 기간: {days_back}일
+
+요약 형식:
+- 🗓️ 기간별 주요 활동 및 트렌드
+- 🏆 주요 참여자들의 기여도
+- 📋 핵심 논의 주제나 결정사항
+- 🔍 반복적으로 언급된 이슈들
+- 📈 활동 패턴이나 변화 추세
+- 💡 향후 주목할 점이나 액션 아이템
+- 8-12줄로 포괄적으로 정리"""
+        
+        response = model.generate_content(prompt)
+        
+        if response.text:
+            # 통계 정보 추가
+            stats_info = f"""📊 **상세 통계:**
+👥 **활성 사용자 TOP 5:**
+{chr(10).join([f"• {name}: {count}개 메시지" for name, count in top_users])}
+
+📅 **기간별 메시지 분포:**
+• 최근 7일: {len(periods['recent'])}개
+• 1-2주 전: {len(periods['weekly'])}개  
+• 2주-{days_back}일 전: {len(periods['monthly'])}개"""
+            
+            return f"""📊 **{days_back}일간 채널 종합 분석**
+
+{response.text.strip()}
+
+───────────────────
+{stats_info}
+
+🔍 **총 분석 데이터**: {len(real_messages)}개 메시지, {len(user_activity)}명 참여"""
+        else:
+            return f"📊 {days_back}일간 채널 분석 생성에 실패했습니다."
+            
+    except Exception as e:
+        print(f"장기 채널 분석 오류: {e}")
+        return f"📊 {days_back}일간 채널 분석 중 오류가 발생했습니다: {str(e)}"
+
 def get_channel_summary(channel_id, hours_back=24):
-    """채널 대화를 요약"""
+    """단기간 채널 대화를 요약 (기존 함수)"""
     try:
         print(f"채널 {channel_id}의 최근 {hours_back}시간 메시지 수집 중...")
         
@@ -285,16 +479,17 @@ def get_gemini_summary(text):
 **기본 요약:**
 • `@GPT Online [메시지 내용] 요약해줘`
 
-**채널 대화 요약:**
+**단기 채널 대화 요약:**
 • `@GPT Online 오늘 채널 대화 요약해줘`
 • `@GPT Online 최근 12시간 채널 메시지 요약해줘`
-• `@GPT Online 어제부터 채널 대화 요약해줘`
+
+**장기 채널 분석:**
+• `@GPT Online 최근 7일간 채널 분석해줘`
+• `@GPT Online 최근 30일간 채널 분석해줘`
+• `@GPT Online 한달간 채널 분석해줘`
 
 **스레드 요약:**
-• 스레드에서 `@GPT Online 이 스레드 요약해줘`
-
-**예시:**
-• `@GPT Online 회의 내용을 공유합니다... 요약해줘`"""
+• 스레드에서 `@GPT Online 이 스레드 요약해줘`"""
         
         # 메시지 형태 감지
         is_conversation = '[' in clean_text and ']' in clean_text
@@ -363,16 +558,24 @@ def get_gemini_summary(text):
 @app.route('/')
 def home():
     return """
-    <h1>🤖 Slack Bot Server - 통합 요약 봇</h1>
+    <h1>🤖 Slack Bot Server - 요약-bot</h1>
     
     <h2>📝 기본 텍스트 요약</h2>
     <p><strong>@GPT Online [내용] 요약해줘</strong></p>
     
-    <h2>📅 채널 대화 요약</h2>
+    <h2>📅 단기 채널 대화 요약</h2>
     <ul>
         <li>@GPT Online 오늘 채널 대화 요약해줘</li>
         <li>@GPT Online 최근 12시간 채널 메시지 요약해줘</li>
         <li>@GPT Online 어제부터 채널 대화 요약해줘</li>
+    </ul>
+    
+    <h2>📊 장기 채널 분석 (NEW!)</h2>
+    <ul>
+        <li>@GPT Online 최근 7일간 채널 분석해줘</li>
+        <li>@GPT Online 최근 30일간 채널 분석해줘</li>
+        <li>@GPT Online 한달간 채널 분석해줘</li>
+        <li>@GPT Online 2주간 채널 분석해줘</li>
     </ul>
     
     <h2>🧵 스레드 요약</h2>
@@ -383,10 +586,11 @@ def home():
         <li>💬 대화 요약: [이름] 형태의 대화 내용</li>
         <li>📄 긴 메시지 요약: 500자 이상의 긴 텍스트</li>
         <li>📋 구조화된 요약: 여러 줄의 구조화된 내용</li>
-        <li>📅 채널 대화 요약: 시간별 채널 메시지 수집</li>
+        <li>📅 단기 채널 요약: 시간별 채널 메시지 수집</li>
+        <li>📊 장기 채널 분석: 일/주/월 단위 트렌드 분석</li>
         <li>🧵 스레드 요약: 스레드 전체 대화 분석</li>
-        
-    <h1> 유용하게 사용하세요. Made By. 숨 </h1>
+
+    <h1> 유용하게 사용하세요 :) Made By. 숨 </h1>
     </ul>
     """
 
@@ -433,14 +637,33 @@ def slack_events():
                 if '<@U092S5G2P7V>' in user_message:
                     print("봇 멘션 감지")
                     
-                    if '요약해줘' in user_message:
+                    if '요약해줘' in user_message or '분석해줘' in user_message:
                         # 스레드 요약 확인
                         if ('스레드' in user_message or '쓰레드' in user_message) and thread_ts:
                             print("스레드 요약 요청")
                             summary = get_thread_summary(channel_id, thread_ts)
                             send_message_to_slack(channel_id, summary)
                         
-                        # 채널 대화 요약 확인
+                        # 장기 채널 분석 확인 (30일, 7일 등)
+                        elif '분석' in user_message or ('일간' in user_message) or ('한달' in user_message) or ('30일' in user_message):
+                            days_back = 30  # 기본값
+                            
+                            if '7일' in user_message or '일주일' in user_message:
+                                days_back = 7
+                            elif '14일' in user_message or '2주' in user_message:
+                                days_back = 14
+                            elif '21일' in user_message or '3주' in user_message:
+                                days_back = 21
+                            elif '30일' in user_message or '한달' in user_message:
+                                days_back = 30
+                            elif '60일' in user_message or '두달' in user_message:
+                                days_back = 60
+                            
+                            print(f"장기 채널 분석 요청: 최근 {days_back}일")
+                            summary = get_long_term_channel_summary(channel_id, days_back)
+                            send_message_to_slack(channel_id, summary)
+                        
+                        # 단기 채널 대화 요약 확인 (시간 단위)
                         elif '채널' in user_message and ('대화' in user_message or '메시지' in user_message):
                             # 시간 파싱
                             hours_back = 24  # 기본값
@@ -459,7 +682,7 @@ def slack_events():
                             elif '3일' in user_message:
                                 hours_back = 72
                             
-                            print(f"채널 대화 요약 요청: 최근 {hours_back}시간")
+                            print(f"단기 채널 대화 요약 요청: 최근 {hours_back}시간")
                             summary = get_channel_summary(channel_id, hours_back)
                             send_message_to_slack(channel_id, summary)
                         
@@ -471,34 +694,40 @@ def slack_events():
                     
                     # 도움말
                     elif '도움말' in user_message or '사용법' in user_message:
-                        help_message = """📚 **GPT Online 통합 요약 봇 사용법**
+                        help_message = """📚 **GPT Online 고급 요약 봇 사용법**
 
 **📝 기본 텍스트 요약:**
 `@GPT Online [요약할 내용] 요약해줘`
 
-**📅 채널 대화 요약:**
+**📅 단기 채널 대화 요약:**
 • `@GPT Online 오늘 채널 대화 요약해줘`
 • `@GPT Online 최근 12시간 채널 메시지 요약해줘`
 • `@GPT Online 어제부터 채널 대화 요약해줘`
-• `@GPT Online 3시간 전부터 채널 대화 요약해줘`
+
+**📊 장기 채널 분석 (NEW!):**
+• `@GPT Online 최근 7일간 채널 분석해줘`
+• `@GPT Online 최근 30일간 채널 분석해줘`
+• `@GPT Online 한달간 채널 분석해줘`
+• `@GPT Online 2주간 채널 분석해줘`
 
 **🧵 스레드 요약:**
 • 스레드에서: `@GPT Online 이 스레드 요약해줘`
 
-**✨ 지원 기능:**
-• 💬 대화 요약 (참여자별 정리)
-• 📄 긴 메시지 요약 (구조화)
-• 📅 시간별 채널 메시지 수집
-• 🧵 스레드 전체 분석
-• ✅ 액션 아이템 추출"""
+**✨ 특별 기능:**
+• 📊 사용자 활동 통계 포함
+• 📈 기간별 트렌드 분석
+• 🏆 활성 사용자 TOP 5
+• 📅 일별/주별 메시지 분포
+• 🔍 핵심 키워드 및 이슈 추출"""
                         send_message_to_slack(channel_id, help_message)
                     
                     else:
-                        help_message = """안녕하세요! 🤖 **통합 요약 봇**입니다!
+                        help_message = """안녕하세요! 🤖 **고급 요약 봇**입니다!
 
 **📝 주요 기능:**
 • 텍스트 요약: `@GPT Online [내용] 요약해줘`
-• 채널 요약: `@GPT Online 오늘 채널 대화 요약해줘`
+• 단기 채널 요약: `@GPT Online 오늘 채널 대화 요약해줘`
+• **장기 채널 분석**: `@GPT Online 최근 30일간 채널 분석해줘` 🆕
 • 스레드 요약: `@GPT Online 이 스레드 요약해줘`
 
 **💬 더 자세한 사용법:**
